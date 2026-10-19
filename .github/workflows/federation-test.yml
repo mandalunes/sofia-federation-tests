@@ -89,9 +89,7 @@ jobs:
                   rows=data.get('branch_policies',[])
                   return bool(rows) and all(r.get('name')=='main' and r.get('type','branch')=='branch' for r in rows)
               except urllib.error.HTTPError as exc:
-                  # Public environment metadata can be unavailable to a token with a
-                  # narrow permission set. The observation is retained as a failed gate
-                  # check, not interpreted as successful configuration enforcement.
+                  # An absent branch-policy resource is not evidence of enforcement.
                   event('Environment metadata query',HTTPStatus=exc.code)
                   return False
           
@@ -131,9 +129,31 @@ jobs:
               event('Retained pre-cutoff token unavailable',Reason='Identity token already expired')
               t3,claims3=token();c=assume(t3,'sofia-after-cutoff');expiry=claims3['exp'];source='Fresh token from admitted job'
           if c is None:raise SystemExit('Post-cutoff assumption failed.')
-          read_role(c,'Post-cutoff session')
+          outcome=read_role(c,'Post-cutoff session')
+          # The console can select a cutoff in the near future. Keep the identity
+          # token unchanged while testing sessions created after the effective cutoff.
+          until=time.monotonic()+180
+          while outcome=='AccessDenied' and time.monotonic()<until and time.time()<expiry-5:
+              time.sleep(5)
+              c=assume(t2 if source=='Retained pre-cutoff identity token' else t3,'sofia-after-cutoff')
+              if c is None:raise SystemExit('Repeated post-cutoff assumption failed.')
+              outcome=read_role(c,'Post-cutoff session')
+          if outcome!='Allowed':raise SystemExit('No permission-checked post-cutoff session was obtained.')
           event('Waiting for identity token expiration',TokenExpiration=expiry,Source=source)
           while time.time()<=expiry+2:time.sleep(min(5,max(.2,expiry+2-time.time())))
           read_role(c,'AWS session after identity token expiration')
           event('History test completed',Source=source)
+          
+          event('Ready for cloud reference condition')
+          until=time.monotonic()+600
+          while time.monotonic()<until:
+              value,claims=token()
+              probe=assume(value,'sofia-reference-check')
+              if probe is None:
+                  event('Cloud reference rejection observed',Reference=claims['ref'])
+                  break
+              read_role(probe,'Probe before cloud reference condition')
+              time.sleep(10)
+          else:raise SystemExit('No cloud reference rejection was observed within the test window.')
+          event('Reference-condition test completed')
           PYTHON
