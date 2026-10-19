@@ -1,0 +1,139 @@
+name: SOFIA isolated federation test
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Test mode
+        type: choice
+        options: [check, history]
+        default: check
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  credential-history:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    environment: sofia-test
+    env:
+      SOFIA_ROLE_ARN: ${{ vars.SOFIA_ROLE_ARN }}
+      SOFIA_MODE: ${{ inputs.mode }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check credential history without exposing credentials
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          """Isolated, permission-checked federation pilot for a manual GitHub job."""
+          import base64
+          import datetime as dt
+          import json
+          import os
+          import re
+          import subprocess
+          import tempfile
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          
+          ROLE=os.environ['SOFIA_ROLE_ARN']
+          ROLE_NAME=ROLE.rsplit('/',1)[-1]
+          REPO=os.environ['GITHUB_REPOSITORY']
+          MODE=os.environ.get('SOFIA_MODE','check')
+          os.environ['AWS_EC2_METADATA_DISABLED']='true'
+          os.environ['AWS_DEFAULT_REGION']='us-east-1'
+          
+          def event(name,**values):
+              record={'Event':name,'UTC':dt.datetime.now(dt.timezone.utc).isoformat(timespec='milliseconds'),**values}
+              print('SOFIA_EVENT '+json.dumps(record,sort_keys=True),flush=True)
+          
+          def token():
+              url=os.environ['ACTIONS_ID_TOKEN_REQUEST_URL']+'&audience='+urllib.parse.quote('sts.amazonaws.com')
+              req=urllib.request.Request(url,headers={'Authorization':'Bearer '+os.environ['ACTIONS_ID_TOKEN_REQUEST_TOKEN']})
+              with urllib.request.urlopen(req,timeout=30) as response:value=json.load(response)['value']
+              payload=value.split('.')[1]
+              claims=json.loads(base64.urlsafe_b64decode(payload+'='*((-len(payload))%4)))
+              selected={k:claims.get(k) for k in ('iss','aud','sub','ref','repository_id','environment','iat','exp','run_id','run_attempt')}
+              event('Identity token obtained',Claims=selected)
+              return value,claims
+          
+          def error_code(text):
+              match=re.search(r'\(([^)]+)\) when calling',text)
+              return match.group(1) if match else 'Unclassified CLI error'
+          
+          def assume(value,label):
+              with tempfile.NamedTemporaryFile(mode='w',prefix='sofia-token-',delete=True) as stream:
+                  os.chmod(stream.name,0o600);stream.write(value);stream.flush()
+                  args=['aws','sts','assume-role-with-web-identity','--role-arn',ROLE,'--role-session-name',label,'--web-identity-token','file://'+stream.name,'--duration-seconds','900','--no-sign-request','--output','json','--no-cli-pager']
+                  result=subprocess.run(args,capture_output=True,text=True,timeout=40)
+              if result.returncode:
+                  event('Role assumption',Label=label,Accepted=False,Error=error_code(result.stderr));return None
+              data=json.loads(result.stdout)
+              credentials=data['Credentials']
+              event('Role assumption',Label=label,Accepted=True,SessionExpiration=credentials['Expiration'])
+              return credentials
+          
+          def read_role(credentials,label,quiet=False):
+              environment=os.environ.copy()
+              environment.update(AWS_ACCESS_KEY_ID=credentials['AccessKeyId'],AWS_SECRET_ACCESS_KEY=credentials['SecretAccessKey'],AWS_SESSION_TOKEN=credentials['SessionToken'])
+              result=subprocess.run(['aws','iam','get-role','--role-name',ROLE_NAME,'--output','json','--no-cli-pager'],env=environment,capture_output=True,text=True,timeout=40)
+              code='Allowed' if not result.returncode else error_code(result.stderr)
+              if not quiet:event('Permission-checked role read',Label=label,Outcome=code)
+              return code
+          
+          def gate_is_main_only():
+              req=urllib.request.Request('https://api.github.com/repos/'+REPO+'/environments/sofia-test/deployment-branch-policies',headers={'Accept':'application/vnd.github+json','Authorization':'Bearer '+os.environ['GITHUB_TOKEN'],'X-GitHub-Api-Version':'2022-11-28'})
+              try:
+                  with urllib.request.urlopen(req,timeout=20) as response:data=json.load(response)
+                  rows=data.get('branch_policies',[])
+                  return bool(rows) and all(r.get('name')=='main' and r.get('type','branch')=='branch' for r in rows)
+              except urllib.error.HTTPError as exc:
+                  # Public environment metadata can be unavailable to a token with a
+                  # narrow permission set. The observation is retained as a failed gate
+                  # check, not interpreted as successful configuration enforcement.
+                  event('Environment metadata query',HTTPStatus=exc.code)
+                  return False
+          
+          event('Job started',Mode=MODE,Reference=os.environ['GITHUB_REF'],Run=os.environ['GITHUB_RUN_ID'],Attempt=os.environ['GITHUB_RUN_ATTEMPT'])
+          t1,claims1=token();a=assume(t1,'sofia-initial')
+          if a is None:raise SystemExit('Initial assumption failed; no later assertion is made.')
+          if read_role(a,'Initial session')!='Allowed':raise SystemExit('Initial permission check failed.')
+          if MODE=='check':raise SystemExit(0)
+          
+          event('Ready for environment restriction')
+          until=time.monotonic()+600
+          while time.monotonic()<until:
+              if gate_is_main_only():break
+              time.sleep(10)
+          else:raise SystemExit('No main-only environment configuration was observed within the test window.')
+          event('Main-only environment rule observed')
+          read_role(a,'Session after upstream restriction')
+          if time.time()<claims1['exp']:
+              retained=assume(t1,'sofia-retained')
+              if retained:read_role(retained,'Retained identity token after restriction')
+          else:event('Retained token test unavailable',Reason='Identity token already expired')
+          t2,claims2=token()
+          b=assume(t2,'sofia-after-gate')
+          if b:read_role(b,'New identity token from admitted job')
+          event('Ready for session cutoff')
+          until=time.monotonic()+600
+          while time.monotonic()<until:
+              outcome=read_role(a,'Initial session cutoff observation',quiet=True)
+              if outcome=='AccessDenied':
+                  event('Initial session denied after cutoff',Outcome=outcome);break
+              if outcome!='Allowed':raise SystemExit('Session check failed for a reason other than explicit denial: '+outcome)
+              time.sleep(5)
+          else:raise SystemExit('No cutoff denial was observed within the test window.')
+          if time.time()<claims2['exp']:
+              c=assume(t2,'sofia-after-cutoff');expiry=claims2['exp'];source='Retained pre-cutoff identity token'
+          else:
+              event('Retained pre-cutoff token unavailable',Reason='Identity token already expired')
+              t3,claims3=token();c=assume(t3,'sofia-after-cutoff');expiry=claims3['exp'];source='Fresh token from admitted job'
+          if c is None:raise SystemExit('Post-cutoff assumption failed.')
+          read_role(c,'Post-cutoff session')
+          event('Waiting for identity token expiration',TokenExpiration=expiry,Source=source)
+          while time.time()<=expiry+2:time.sleep(min(5,max(.2,expiry+2-time.time())))
+          read_role(c,'AWS session after identity token expiration')
+          event('History test completed',Source=source)
+          PYTHON
